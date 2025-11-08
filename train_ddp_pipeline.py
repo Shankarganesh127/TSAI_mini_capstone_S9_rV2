@@ -21,6 +21,8 @@ Environment:
 """
 from __future__ import annotations
 import argparse, os, time, json, math
+# Prefer expandable CUDA segments to reduce fragmentation when close to VRAM limit
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 from pathlib import Path
 from typing import List, Dict
 
@@ -36,6 +38,17 @@ import torchvision.transforms as T
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# Global toggles (set in main from args)
+CHANNELS_LAST = True
+
+# Augmentation/regularization config (set from args in main)
+AUG_POLICY = 'none'            # one of: 'none', 'autoaugment', 'randaugment'
+RAND_N = 2                     # RandAugment: number of ops
+RAND_M = 9                     # RandAugment: magnitude (0-10)
+COLOR_JITTER = 0.0             # strength for ColorJitter (0 disables)
+RANDOM_ERASING_P = 0.0         # probability for RandomErasing (0 disables)
+LABEL_SMOOTHING = 0.0          # training-time label smoothing
 
 # -----------------------------
 # Unified Logging
@@ -80,12 +93,29 @@ def barrier():
 # -----------------------------
 
 def build_transforms():
-    train_tfms = T.Compose([
+    # Build training transforms with optional strong augmentation and regularization
+    train_list = [
         T.RandomResizedCrop(224),
         T.RandomHorizontalFlip(),
+    ]
+    # Strong policy augmentations
+    if AUG_POLICY == 'autoaugment':
+        train_list.append(T.AutoAugment(T.AutoAugmentPolicy.IMAGENET))
+    elif AUG_POLICY == 'randaugment':
+        # Typical settings: n=2 ops, magnitude 9
+        train_list.append(T.RandAugment(num_ops=RAND_N, magnitude=RAND_M))
+    # Color jitter for additional regularization
+    if COLOR_JITTER and COLOR_JITTER > 0:
+        train_list.append(T.ColorJitter(brightness=COLOR_JITTER, contrast=COLOR_JITTER, saturation=COLOR_JITTER, hue=min(0.5, COLOR_JITTER/4)))
+    # To tensor and normalize
+    train_list.extend([
         T.ToTensor(),
         T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
     ])
+    # Random erasing applied on tensors (after normalization)
+    if RANDOM_ERASING_P and RANDOM_ERASING_P > 0:
+        train_list.append(T.RandomErasing(p=RANDOM_ERASING_P, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random'))
+    train_tfms = T.Compose(train_list)
     val_tfms = T.Compose([
         T.Resize(256), T.CenterCrop(224), T.ToTensor(),
         T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
@@ -153,13 +183,18 @@ class BatchSizeFinder:
     def _probe(self, bs, steps=5):
         loader = DataLoader(self.ds, batch_size=bs, shuffle=True, num_workers=self.workers, pin_memory=torch.cuda.is_available())
         model = self.model_fn().to(self.device)
+        if CHANNELS_LAST:
+            model = model.to(memory_format=torch.channels_last)
         model.eval()
         torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
         ok=True
         try:
             for i,(x,y) in enumerate(loader):
                 if i>=steps: break
-                x=x.to(self.device); y=y.to(self.device)
+                x=x.to(self.device)
+                if CHANNELS_LAST and x.is_floating_point():
+                    x = x.to(memory_format=torch.channels_last)
+                y=y.to(self.device)
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=torch.cuda.is_available()):
                     out=model(x); loss=nn.functional.cross_entropy(out,y)
                 loss.backward()  # allocate grads
@@ -199,6 +234,8 @@ class LRFinderSimple:
         self.model_fn=model_fn; self.loader=loader; self.device=device
     def range_test(self, start_lr=1e-5, end_lr=1, num_iter=100):
         model=self.model_fn().to(self.device)
+        if CHANNELS_LAST:
+            model = model.to(memory_format=torch.channels_last)
         opt=SGD(model.parameters(), lr=start_lr, momentum=0.9)
         criterion=nn.CrossEntropyLoss()
         lrs=[]; losses=[]
@@ -207,10 +244,19 @@ class LRFinderSimple:
         for i,(x,y) in enumerate(self.loader):
             if i>=num_iter: break
             x=x.to(self.device); y=y.to(self.device)
+            if CHANNELS_LAST and x.is_floating_point():
+                x = x.to(memory_format=torch.channels_last)
             for g in opt.param_groups: g['lr']=lr
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=torch.cuda.is_available()):
                 out=model(x); loss=criterion(out,y)
-            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+            opt.zero_grad(set_to_none=True)
+            # Use scaled gradients to reduce peak memory during LR search
+            scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             lrs.append(lr); losses.append(loss.item()); lr*=lr_mult
         return {'lrs':lrs,'losses':losses}
 
@@ -234,25 +280,34 @@ class WDFinder:
         results=[]
         criterion=nn.CrossEntropyLoss()
         for wd in wds:
-            model=self.model_fn().to(self.device); opt=SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
+            model=self.model_fn().to(self.device)
+            if CHANNELS_LAST:
+                model = model.to(memory_format=torch.channels_last)
+            opt=SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
             scaler=torch.amp.GradScaler(enabled=torch.cuda.is_available())
             model.train(); it=0
             for x,y in self.train_loader:
                 if it>=steps: break
                 x=x.to(self.device); y=y.to(self.device)
+                if CHANNELS_LAST and x.is_floating_point():
+                    x = x.to(memory_format=torch.channels_last)
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=torch.cuda.is_available()):
                     out=model(x); loss=criterion(out,y)
                 opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); it+=1
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             # quick val
             model.eval(); correct=0; total=0
             with torch.no_grad():
                 for vx,vy in self.val_loader:
                     vx=vx.to(self.device); vy=vy.to(self.device)
                     out=model(vx); pred=out.argmax(1); correct+=(pred==vy).sum().item(); total+=vy.size(0)
-                    if total>10000: break  # early limit for speed
+                    if total>=2048: break  # early limit for speed (kept small to avoid NCCL timeouts on idle ranks)
             acc=100.0*correct/total
             results.append({'wd':wd,'val_top1':acc})
             del model,opt
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return results
 
 
@@ -281,10 +336,10 @@ def accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1,)):
 # Training Loop
 # -----------------------------
 
-def train(model, train_loader, val_loader, device, epochs, lr, wd, scheduler_type, logger):
+def train(model, train_loader, val_loader, device, epochs, lr, wd, scheduler_type, logger, grad_accum: int = 1, label_smoothing: float = 0.0):
     scaler=torch.amp.GradScaler(enabled=torch.cuda.is_available())
     optimizer=SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd, nesterov=True)
-    steps_per_epoch=len(train_loader)
+    steps_per_epoch=math.ceil(len(train_loader)/max(1, grad_accum))
     # Scheduler selection (OneCycle supports pct_start and custom max_lr)
     onecycle_pct_start = getattr(train, "onecycle_pct_start", 0.1)  # default if not patched
     onecycle_max_lr = getattr(train, "onecycle_max_lr", None)
@@ -298,32 +353,71 @@ def train(model, train_loader, val_loader, device, epochs, lr, wd, scheduler_typ
         if is_primary():
             logger.info(f"[SCHED] CosineAnnealingLR T_max={epochs}")
     best_top1=0.0
+    if is_primary():
+        logger.info(f"[TRAIN] grad_accum={grad_accum} steps_per_epoch={steps_per_epoch}")
+    epoch_times=[]
+    # Training loss (with optional label smoothing)
+    criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing)).to(device)
     for epoch in range(1, epochs+1):
         model.train(); epoch_loss=0.0; epoch_top1=0.0; total=0
+        t_epoch_start=time.time()
+        if is_primary():
+            logger.info(f"[EPOCH-START] epoch={epoch} start={time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t_epoch_start))}")
         if isinstance(train_loader.sampler, DistributedSampler): train_loader.sampler.set_epoch(epoch)
+        optimizer.zero_grad(set_to_none=True)
+        accum=0; last_log_t=time.time()
+        log_interval=getattr(train,'log_interval',50)
         for i,(x,y) in enumerate(train_loader):
             x=x.to(device, non_blocking=True); y=y.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
+            if CHANNELS_LAST and x.is_floating_point():
+                x = x.to(memory_format=torch.channels_last)
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=torch.cuda.is_available()):
-                out=model(x); loss=nn.functional.cross_entropy(out,y)
-            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
+                out=model(x); loss=criterion(out,y)
+            loss = loss / max(1, grad_accum)
+            scaler.scale(loss).backward(); accum += 1
+            do_step = (accum % max(1, grad_accum) == 0) or (i == len(train_loader)-1)
+            if do_step:
+                scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)
+                if scheduler_type=='onecycle': scheduler.step()
             with torch.no_grad(): top1,=accuracy(out,y,(1,))
             epoch_loss+=loss.item()*x.size(0); epoch_top1+=top1.item()*x.size(0)/100.0; total+=x.size(0)
-        scheduler.step()
-        # reduce metrics
+            if is_primary() and ((i+1) % max(1,log_interval)==0):
+                now=time.time(); dt=now-last_log_t; last_log_t=now
+                cur_lr=optimizer.param_groups[0]['lr']; pct=100.0*(i+1)/len(train_loader)
+                logger.info(f"[PROGRESS] epoch={epoch} step={i+1}/{len(train_loader)} ({pct:.1f}%) lr={cur_lr:.3e} loss={loss.item():.4f}")
+        if scheduler_type!='onecycle': scheduler.step()
         metrics=torch.tensor([epoch_loss, epoch_top1, float(total)], device=device)
         if is_dist(): dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
         loss_epoch=metrics[0].item()/metrics[2].item(); top1_epoch=(metrics[1].item()/metrics[2].item())*100.0
-        if is_primary(): logger.info(f"[TRAIN] epoch={epoch} loss={loss_epoch:.4f} top1={top1_epoch:.2f}%")
-        # validation
+        t_epoch_end=time.time(); dur=t_epoch_end-t_epoch_start
+        if is_primary():
+            logger.info(f"[TRAIN] epoch={epoch} loss={loss_epoch:.4f} top1={top1_epoch:.2f}%")
+            logger.info(f"[EPOCH-END] epoch={epoch} end={time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t_epoch_end))} duration_sec={dur:.1f}")
         val_loss, val_top1 = validate(model, val_loader, device)
         if is_primary(): logger.info(f"[VAL] epoch={epoch} loss={val_loss:.4f} top1={val_top1:.2f}%")
         if is_primary():
+            epoch_times.append({'epoch':epoch,'start_iso':time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t_epoch_start)),
+                                'end_iso':time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t_epoch_end)),
+                                'duration_sec':round(dur,1),'train_loss':round(loss_epoch,4),
+                                'val_loss':round(val_loss,4),'val_top1':round(val_top1,2)})
             if val_top1>best_top1:
                 best_top1=val_top1
                 save_checkpoint(model, optimizer, scaler, epoch, val_top1, Path('/opt/ml/model/checkpoint_best.pt'))
             save_checkpoint(model, optimizer, scaler, epoch, val_top1, Path('/opt/ml/model/checkpoint_last.pt'))
-    if is_primary(): logger.info(f"Training complete. Best val top1={best_top1:.2f}%")
+    if is_primary():
+        logger.info(f"Training complete. Best val top1={best_top1:.2f}%")
+        # write epoch metrics CSV and plots
+        import csv
+        csv_path=Path('/opt/ml/model/logs/epoch_times.csv'); csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open('w', newline='') as f:
+            writer=csv.DictWriter(f, fieldnames=['epoch','start_iso','end_iso','duration_sec','train_loss','val_loss','val_top1'])
+            writer.writeheader(); writer.writerows(epoch_times)
+        try:
+            ep=[e['epoch'] for e in epoch_times]; tl=[e['train_loss'] for e in epoch_times]; vl=[e['val_loss'] for e in epoch_times]; vt=[e['val_top1'] for e in epoch_times]
+            plt.figure(figsize=(7,4)); plt.plot(ep, tl, label='train'); plt.plot(ep, vl, label='val'); plt.xlabel('epoch'); plt.ylabel('loss'); plt.legend(); plt.grid(True, ls='--', alpha=0.5); plt.title('Loss vs Epoch'); plt.savefig('/opt/ml/model/logs/train_val_loss.png'); plt.close()
+            plt.figure(figsize=(7,4)); plt.plot(ep, vt, label='val_top1'); plt.xlabel('epoch'); plt.ylabel('top1 %'); plt.grid(True, ls='--', alpha=0.5); plt.title('Val Top1 vs Epoch'); plt.savefig('/opt/ml/model/logs/val_top1.png'); plt.close()
+        except Exception:
+            pass
 
 
 def validate(model, loader, device):
@@ -332,6 +426,8 @@ def validate(model, loader, device):
     with torch.no_grad():
         for x,y in loader:
             x=x.to(device, non_blocking=True); y=y.to(device, non_blocking=True)
+            if CHANNELS_LAST and x.is_floating_point():
+                x = x.to(memory_format=torch.channels_last)
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=torch.cuda.is_available()):
                 out=model(x); loss=criterion(out,y)
             top1,=accuracy(out,y,(1,))
@@ -350,9 +446,12 @@ def save_checkpoint(model, optimizer, scaler, epoch, val_top1, path: Path):
 # Model Builder
 # -----------------------------
 
-def build_model(num_classes=1000):
+def build_model(num_classes=1000, sync_bn: bool = True):
+    """Builds the model. SyncBN conversion is optional and used for DDP.
+    Channels-last and torch.compile are applied elsewhere based on args and phase.
+    """
     m = torchvision.models.resnet50(weights=None, num_classes=num_classes)
-    if is_dist():
+    if sync_bn and is_dist():
         m = torch.nn.SyncBatchNorm.convert_sync_batchnorm(m)
     return m
 
@@ -377,18 +476,47 @@ def main():
     ap.add_argument('--worker-probe-batches', type=int, default=32)
     ap.add_argument('--batch-start', type=int, default=32)
     ap.add_argument('--batch-max', type=int, default=1024)
+    ap.add_argument('--batch-safety-factor', type=float, default=0.9,
+                    help='Multiply discovered best batch by this factor for final training to reserve headroom.')
     ap.add_argument('--lr-range-iters', type=int, default=100)
     ap.add_argument('--wd-candidates', type=str, default='1e-5,3e-5,1e-4,3e-4,1e-3')
-    ap.add_argument('--wd-steps', type=int, default=50)
+    ap.add_argument('--wd-steps', type=int, default=20)
     ap.add_argument('--final-epochs', type=int, default=10)
     ap.add_argument('--onecycle-pct-start', type=float, default=0.1)
+    ap.add_argument('--onecycle-warmup-epochs', type=int, default=None, help='If set, overrides pct_start so that warmup spans this many epochs.')
     ap.add_argument('--onecycle-max-lr', type=float, default=None)
+    # Augmentation & regularization flags
+    ap.add_argument('--aug-policy', choices=['none','autoaugment','randaugment'], default='none', help='Strong augmentation policy to apply.')
+    ap.add_argument('--randaugment-n', type=int, default=2, help='RandAugment number of ops (when aug-policy=randaugment).')
+    ap.add_argument('--randaugment-m', type=int, default=9, help='RandAugment magnitude (0-10).')
+    ap.add_argument('--color-jitter', type=float, default=0.0, help='ColorJitter strength (0 disables).')
+    ap.add_argument('--random-erasing-p', type=float, default=0.0, help='Probability of RandomErasing (0 disables).')
+    ap.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing value for CrossEntropyLoss.')
+    # Memory/format/perf options
+    ap.add_argument('--channels-last', dest='channels_last', action='store_true', help='Use channels_last memory format for tensors and model')
+    ap.add_argument('--no-channels-last', dest='channels_last', action='store_false')
+    ap.set_defaults(channels_last=True)
+    ap.add_argument('--compile', action='store_true', help='Enable torch.compile for final training model')
+    ap.add_argument('--compile-mode', choices=['default','reduce-overhead','max-autotune'], default='reduce-overhead')
+    ap.add_argument('--search-batch-fraction', type=float, default=0.5,
+                    help='Fraction of discovered max batch size to use during LR/WD search phases (safety headroom to prevent OOM).')
     ap.add_argument('--override-batch', type=int, default=None)
     ap.add_argument('--override-lr', type=float, default=None)
     ap.add_argument('--override-wd', type=float, default=None)
+    ap.add_argument('--grad-accum', type=int, default=0, help='Gradient accumulation steps; 0 = auto (preserve effective per-GPU batch from raw_best).')
     args=ap.parse_args()
 
     init_dist()
+    # Set global toggles from args
+    global CHANNELS_LAST
+    global AUG_POLICY, RAND_N, RAND_M, COLOR_JITTER, RANDOM_ERASING_P, LABEL_SMOOTHING
+    CHANNELS_LAST = bool(args.channels_last)
+    AUG_POLICY = args.aug_policy
+    RAND_N = args.randaugment_n
+    RAND_M = args.randaugment_m
+    COLOR_JITTER = args.color_jitter
+    RANDOM_ERASING_P = args.random_erasing_p
+    LABEL_SMOOTHING = args.label_smoothing
     device=torch.device(f"cuda:{os.environ.get('LOCAL_RANK',0)}" if torch.cuda.is_available() else 'cpu')
 
     logs_dir=Path('/opt/ml/model/logs'); logger=setup_logger(logs_dir,'pipeline')
@@ -407,10 +535,13 @@ def main():
 
     # 2. Batch size finder
     if is_primary():
-        bs_finder=BatchSizeFinder(lambda: build_model(), args.train_dir, device, workers)
+        bs_finder=BatchSizeFinder(lambda: build_model(sync_bn=False), args.train_dir, device, workers)
         bs_report=bs_finder.find(start=args.batch_start, max_bs=args.batch_max)
-        best_batch=bs_report['best']
-        plot_batch_curve(bs_report['curve'], best_batch, logs_dir/'batchsize.png')
+        raw_best=bs_report['best']
+        best_batch=int(max(1, raw_best * args.batch_safety_factor))
+        if best_batch < raw_best:
+            logger.info(f"Applying batch_safety_factor={args.batch_safety_factor} raw_best={raw_best} final_batch={best_batch}")
+        plot_batch_curve(bs_report['curve'], raw_best, logs_dir/'batchsize.png')
     else:
         best_batch=args.batch_start
     if args.override_batch is not None: best_batch=args.override_batch
@@ -418,12 +549,17 @@ def main():
         bs_tensor=torch.tensor([best_batch], device=device); dist.broadcast(bs_tensor, src=0); best_batch=int(bs_tensor.item())
     if is_primary(): logger.info(f"Selected batch_size={best_batch}")
 
-    # Build a temporary loader for LR & WD tests
-    train_loader_tmp, val_loader_tmp, _, _ = make_loaders(args.train_dir, args.val_dir, best_batch, workers)
+    # Build a temporary loader for LR & WD tests using reduced batch for headroom
+    search_batch = max(1, int(best_batch * args.search_batch_fraction))
+    if search_batch < best_batch and is_primary():
+        logger.info(f"Using reduced batch_size={search_batch} (fraction={args.search_batch_fraction}) for LR/WD search phases to provide memory headroom (final batch={best_batch}).")
+    train_loader_tmp, val_loader_tmp, _, _ = make_loaders(args.train_dir, args.val_dir, search_batch, workers)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # 3. LR Finder
     if is_primary():
-        lr_finder=LRFinderSimple(lambda: build_model(), train_loader_tmp, device)
+        lr_finder=LRFinderSimple(lambda: build_model(sync_bn=False), train_loader_tmp, device)
         lr_report=lr_finder.range_test(num_iter=args.lr_range_iters)
         suggested_lr=plot_lr_curve(lr_report, logs_dir/'lr_finder.png')
     else:
@@ -436,28 +572,106 @@ def main():
     # 4. Weight Decay Finder
     if is_primary():
         wd_values=[float(w) for w in args.wd_candidates.split(',')]
-        wd_finder=WDFinder(lambda: build_model(), train_loader_tmp, val_loader_tmp, device)
+        wd_finder=WDFinder(lambda: build_model(sync_bn=False), train_loader_tmp, val_loader_tmp, device)
         wd_results=wd_finder.test(wd_values, steps=args.wd_steps, lr=suggested_lr)
         best_wd=plot_wd(wd_results, logs_dir/'weight_decay.png')
+        # Signal to other ranks that WD search is complete to avoid long NCCL blocking waits
+        try:
+            (logs_dir / 'wd_ready.flag').touch()
+        except Exception:
+            pass
     else:
         best_wd=1e-4
     if args.override_wd is not None: best_wd=args.override_wd
     if is_dist():
+        # For non-primary ranks, avoid entering a long blocking broadcast until rank0 has finished WD search
+        if not is_primary():
+            flag_path = logs_dir / 'wd_ready.flag'
+            waited = 0
+            while not flag_path.exists():
+                time.sleep(2)
+                waited += 2
+                if waited % 60 == 0 and is_primary():
+                    pass
         wd_tensor=torch.tensor([best_wd], device=device); dist.broadcast(wd_tensor, src=0); best_wd=float(wd_tensor.item())
     if is_primary(): logger.info(f"Selected weight_decay={best_wd:.2e}")
 
     barrier()
 
     # 5. Full training
+    # Rebuild loaders for full training (ensure no leftover reduced batch)
     train_loader, val_loader, _, _ = make_loaders(args.train_dir, args.val_dir, best_batch, workers)
-    model=build_model().to(device)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    model=build_model(sync_bn=True).to(device)
+    # Enable cudnn benchmark for final training stability/performance (after batch size fixed)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+    # Apply channels_last & compile only once for final model
+    if CHANNELS_LAST:
+        model = model.to(memory_format=torch.channels_last)
+    if args.compile and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode=args.compile_mode)
+            if is_primary():
+                logger.info(f"[OPT] torch.compile applied (mode={args.compile_mode})")
+        except Exception as e:
+            if is_primary():
+                logger.info(f"[OPT] torch.compile skipped: {e}")
     if is_dist():
         model=DDP(model, device_ids=[int(os.environ.get('LOCAL_RANK',0))], output_device=int(os.environ.get('LOCAL_RANK',0)), find_unused_parameters=False)
-    if is_primary(): logger.info(f"Starting full training: epochs={args.final_epochs} batch_size={best_batch} lr={suggested_lr:.4e} wd={best_wd:.2e} scheduler={args.scheduler}")
     # Inject OneCycle parameters into train function (simple way without refactor)
+    # Override pct_start if warmup epochs explicitly provided
+    if args.scheduler == 'onecycle' and args.onecycle_warmup_epochs is not None:
+        computed_pct = args.onecycle_warmup_epochs / max(1, args.final_epochs)
+        # Clamp to (0, 0.9] to avoid extremely long warmup impacting decay phase
+        computed_pct = max(0.0, min(0.9, computed_pct))
+        if is_primary():
+            logger.info(f"[SCHED] onecycle warmup_epochs={args.onecycle_warmup_epochs} final_epochs={args.final_epochs} -> pct_start={computed_pct:.3f}")
+        args.onecycle_pct_start = computed_pct
     train.onecycle_pct_start = args.onecycle_pct_start
     train.onecycle_max_lr = args.onecycle_max_lr
-    train(model, train_loader, val_loader, device, args.final_epochs, suggested_lr, best_wd, args.scheduler, logger)
+    try:
+        # Auto gradient accumulation: if grad_accum==0 and safety factor shrank batch, try to keep raw effective batch
+        if args.grad_accum == 0:
+            if 'raw_best' in locals() and best_batch < raw_best:
+                # approximate accumulation factor
+                auto_accum = max(1, raw_best // max(1, best_batch))
+                grad_accum = auto_accum
+                if is_primary():
+                    logger.info(f"Auto gradient accumulation enabled: raw_best={raw_best} reduced_batch={best_batch} grad_accum={grad_accum}")
+            else:
+                grad_accum = 1
+        else:
+            grad_accum = max(1, args.grad_accum)
+        # Auto-scale LR from search effective batch to final effective global batch (considering world size and grad accumulation)
+        world = get_world_size()
+        eff_train_global = max(1, best_batch) * max(1, grad_accum) * max(1, world)
+        eff_search_global = max(1, search_batch)  # search ran on rank0 only
+        if args.override_lr is None:
+            scale = eff_train_global / eff_search_global
+            auto_lr = suggested_lr * scale
+            lr_floor = 1e-3
+            lr_cap = 2.5e-1
+            auto_lr_clamped = min(max(auto_lr, lr_floor), lr_cap)
+            if is_primary():
+                logger.info(f"[LR AUTO] found={suggested_lr:.2e} scale={scale:.2f} auto={auto_lr:.2e} clamped={auto_lr_clamped:.2e} (floor={lr_floor:.0e}, cap={lr_cap:.2f})")
+            suggested_lr = auto_lr_clamped
+        # Broadcast final LR to all ranks
+        if is_dist():
+            lr_tensor=torch.tensor([suggested_lr], device=device); dist.broadcast(lr_tensor, src=0); suggested_lr=float(lr_tensor.item())
+        if is_primary():
+            logger.info(f"Starting full training: epochs={args.final_epochs} batch_size={best_batch} lr={suggested_lr:.4e} wd={best_wd:.2e} scheduler={args.scheduler}")
+        train(model, train_loader, val_loader, device, args.final_epochs, suggested_lr, best_wd, args.scheduler, logger, grad_accum=grad_accum, label_smoothing=LABEL_SMOOTHING)
+    finally:
+        # Defer process group destruction until after final barrier and summary write.
+        pass
+
+    # Synchronize all ranks before writing summary / destroying process group.
+    if is_dist():
+        barrier()
 
     if is_primary():
         logger.info("Pipeline completed successfully.")
@@ -472,7 +686,9 @@ def main():
         }
         with open('/opt/ml/model/logs/summary.json','w') as f: json.dump(summary,f,indent=2)
 
-    barrier()
+    if is_dist():
+        # Clean shutdown to avoid NCCL lingering warnings; ensure no further collectives.
+        dist.destroy_process_group()
 
 if __name__=='__main__':
     main()

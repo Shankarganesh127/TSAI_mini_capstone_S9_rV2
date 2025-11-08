@@ -6,4 +6,5 @@ resnet50_logs/
 imagenet1k/
 logs/
 user-default-efs
+TSAI_mini_capstone_S9_rV2
 

@@ -20,6 +20,7 @@ import tempfile
 from pathlib import Path
 
 from sagemaker.pytorch import PyTorch
+from sagemaker.inputs import TrainingInput
 import sagemaker
 import boto3
 
@@ -40,6 +41,8 @@ def parse_args():
     p.add_argument("--no-spot", action="store_true", help="Disable spot instance usage")
     p.add_argument("--entry-point", default="train_from_notebook.py", help="Entry script inside source_dir (default: notebook executor)")
     p.add_argument("--no-wait", action="store_true", help="Submit job asynchronously and return immediately")
+    p.add_argument("--input-mode", choices=["File", "FastFile", "Pipe"], default="FastFile",
+                   help="SageMaker channel input mode. FastFile streams from S3, reducing startup download time.")
     # DDP training options
     p.add_argument("--use-ddp", action="store_true", help="Force DDP training entry (train_ddp.py) even on single instance")
     p.add_argument("--epochs", type=int, default=1)
@@ -57,6 +60,16 @@ def parse_args():
                    help="OneCycleLR pct_start (fraction of cycle spent increasing LR)")
     p.add_argument("--onecycle-max-lr", type=float, default=None,
                    help="Override OneCycleLR max_lr (defaults to LR discovered by LR finder)")
+    p.add_argument("--onecycle-warmup-epochs", type=int, default=None,
+                   help="Explicit warmup epochs for OneCycleLR (overrides pct_start when set)")
+    # Augmentation / regularization passthrough for pipeline script
+    p.add_argument("--aug-policy", choices=["none","autoaugment","randaugment"], default="none",
+                   help="Augmentation policy for pipeline training script")
+    p.add_argument("--randaugment-n", type=int, default=2, help="RandAugment number of ops")
+    p.add_argument("--randaugment-m", type=int, default=9, help="RandAugment magnitude (0-10)")
+    p.add_argument("--color-jitter", type=float, default=0.0, help="ColorJitter strength (0 disables)")
+    p.add_argument("--random-erasing-p", type=float, default=0.0, help="RandomErasing probability (0 disables)")
+    p.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing value")
     return p.parse_args()
 
 
@@ -146,6 +159,16 @@ def main():
             hps["onecycle-pct-start"] = args.onecycle_pct_start
             if args.onecycle_max_lr is not None:
                 hps["onecycle-max-lr"] = args.onecycle_max_lr
+            if args.onecycle_warmup_epochs is not None:
+                hps["onecycle-warmup-epochs"] = args.onecycle_warmup_epochs
+        # Augmentation/regularization flags for pipeline
+        if args.aug_policy is not None:
+            hps["aug-policy"] = args.aug_policy
+        hps["randaugment-n"] = args.randaugment_n
+        hps["randaugment-m"] = args.randaugment_m
+        hps["color-jitter"] = args.color_jitter
+        hps["random-erasing-p"] = args.random_erasing_p
+        hps["label-smoothing"] = args.label_smoothing
     else:
         hps = {
             "epochs": args.epochs,
@@ -199,19 +222,23 @@ def main():
     )
 
     inputs = {
-        "train": train_channel,
-        "val": val_channel,
+        "train": TrainingInput(s3_data=train_channel, input_mode=args.input_mode, distribution="FullyReplicated"),
+        "val": TrainingInput(s3_data=val_channel, input_mode=args.input_mode, distribution="FullyReplicated"),
     }
 
     print(f"Submitting training job: {job_name}")
     print(f"Spot instances enabled: {not args.no_spot}")
     print(f"Output path: {s3_output}")
     print(f"Data channels: train={train_channel} val={val_channel}")
+    print(f"Input mode: {args.input_mode}")
     print(f"Entry point: {entry_point} | torch.distributed enabled: {enable_dist}")
     if entry_point == "train_ddp_pipeline.py":
         line = f"Pipeline settings → scheduler={hps.get('scheduler')} final-epochs={hps.get('final-epochs')}"
         if hps.get('scheduler') == 'onecycle':
-            line += f" onecycle-pct-start={hps.get('onecycle-pct-start')} onecycle-max-lr={hps.get('onecycle-max-lr', 'auto')}"
+            line += f" onecycle-pct-start={hps.get('onecycle-pct-start')} onecycle-warmup-epochs={hps.get('onecycle-warmup-epochs','auto')} onecycle-max-lr={hps.get('onecycle-max-lr', 'auto')}"
+        line += (f" aug-policy={hps.get('aug-policy','none')} randaugment(n={hps.get('randaugment-n')},m={hps.get('randaugment-m')})"
+                 f" color-jitter={hps.get('color-jitter')} random-erasing-p={hps.get('random-erasing-p')}"
+                 f" label-smoothing={hps.get('label-smoothing')}")
         print(line)
     print(f"Using PyTorch framework_version={args.framework_version} with {args.py_version}")
 
