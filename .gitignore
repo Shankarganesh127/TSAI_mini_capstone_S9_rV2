@@ -1,0 +1,9 @@
+.*
+!.gitignore
+!.gitattributes
+
+resnet50_logs/
+imagenet1k/
+logs/
+user-default-efs
+
