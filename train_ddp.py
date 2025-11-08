@@ -141,7 +141,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, log_interva
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
             out = model(x)
             loss = criterion(out, y)
         scaler.scale(loss).backward()
@@ -177,7 +177,7 @@ def validate(model, loader, device):
         for x, y in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
                 out = model(x)
                 loss = criterion(out, y)
             top1, = accuracy(out, y, topk=(1,))
@@ -229,7 +229,7 @@ def main():
 
     optimizer = SGD(model.parameters(), lr=args.lr, momentum=0.9, nesterov=args.nesterov, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
 
     best_top1 = 0.0
     model_dir = Path("/opt/ml/model")
