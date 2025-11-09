@@ -686,9 +686,16 @@ def main():
             if bool(args.auto_install_dali) and is_primary():
                 try:
                     import subprocess, sys
-                    cuda_major = torch.version.cuda.split('.')[0] if torch.version.cuda else '120'
-                    # Map simple major to a package variant (best-effort)
-                    pkg = 'nvidia-dali-cuda' + cuda_major
+                    cuda_ver = (torch.version.cuda or '').strip()
+                    # Map CUDA version to correct DALI wheel name
+                    # CUDA 12.x -> nvidia-dali-cuda120, CUDA 11.8 -> nvidia-dali-cuda118 (most common images)
+                    if cuda_ver.startswith('12'):
+                        pkg = 'nvidia-dali-cuda120'
+                    elif cuda_ver.startswith('11.8') or cuda_ver.startswith('11'):
+                        pkg = 'nvidia-dali-cuda118'
+                    else:
+                        # Fallback: try CUDA 12.0 build which works across 12.x toolkits in most SM images
+                        pkg = 'nvidia-dali-cuda120'
                     print(f"[DALI] Attempting auto-install of {pkg} via pip...")
                     subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg])
                     try:

@@ -1,0 +1,4 @@
+# Python dependencies to install in the SageMaker training container before running the script.
+# For NVIDIA DALI on CUDA 12.x SageMaker PyTorch images, use the CUDA 12.0 build:
+# If your container uses CUDA 11.8, switch to nvidia-dali-cuda118 instead.
+nvidia-dali-cuda120

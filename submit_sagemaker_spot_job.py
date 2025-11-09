@@ -224,6 +224,7 @@ def main():
             "train_ddp_pipeline.py",
             "TSAI_mini_capstone_imagnet1k_resnet50.ipynb",
             "submit_sagemaker_spot_job.py",
+            "requirements.txt",
         ]
         for fname in want:
             src = Path.cwd() / fname

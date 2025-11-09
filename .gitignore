@@ -1,6 +1,11 @@
 .*
 !.gitignore
 !.gitattributes
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
 
 resnet50_logs/
 imagenet1k/
