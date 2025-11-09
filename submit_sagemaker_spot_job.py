@@ -41,7 +41,7 @@ def parse_args():
     p.add_argument("--no-spot", action="store_true", help="Disable spot instance usage")
     p.add_argument("--entry-point", default="train_from_notebook.py", help="Entry script inside source_dir (default: notebook executor)")
     p.add_argument("--no-wait", action="store_true", help="Submit job asynchronously and return immediately")
-    p.add_argument("--input-mode", choices=["File", "FastFile", "Pipe"], default="FastFile",
+    p.add_argument("--input-mode", choices=["File", "FastFile", "Pipe"], default="File",
                    help="SageMaker channel input mode. FastFile streams from S3, reducing startup download time.")
     # DDP training options
     p.add_argument("--use-ddp", action="store_true", help="Force DDP training entry (train_ddp.py) even on single instance")
@@ -70,6 +70,23 @@ def parse_args():
     p.add_argument("--color-jitter", type=float, default=0.0, help="ColorJitter strength (0 disables)")
     p.add_argument("--random-erasing-p", type=float, default=0.0, help="RandomErasing probability (0 disables)")
     p.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing value")
+    # DALI toggle
+    p.add_argument("--use-dali", action="store_true", help="Enable NVIDIA DALI data pipeline if available in training container")
+    p.add_argument("--auto-install-dali", action="store_true", help="Attempt to pip install NVIDIA DALI on the training container if missing (pipeline entry only)")
+    p.add_argument("--prefetch-factor", type=int, default=None, help="Prefetch factor for DataLoader workers (pipeline entry only)")
+    # Compile toggle (pipeline)
+    p.add_argument("--compile", action="store_true", help="Enable torch.compile in pipeline entry")
+    p.add_argument("--compile-mode", choices=["default","reduce-overhead","max-autotune"], default="reduce-overhead",
+                   help="torch.compile mode for pipeline entry")
+    # LR finder/auto-scale controls
+    p.add_argument("--lr-range-iters", type=int, default=100)
+    p.add_argument("--lr-range-start", type=float, default=1e-5)
+    p.add_argument("--lr-range-end", type=float, default=1.0)
+    p.add_argument("--lr-finder-policy", choices=["min0.1","steepest"], default="min0.1")
+    p.add_argument("--lr-auto-floor", type=float, default=1e-3)
+    p.add_argument("--lr-auto-cap", type=float, default=2.5e-1)
+    # Pipeline worker optimizer cap
+    p.add_argument("--max-workers", type=int, default=None, help="Max num_workers probe cap for pipeline worker optimization")
     return p.parse_args()
 
 
@@ -169,6 +186,23 @@ def main():
         hps["color-jitter"] = args.color_jitter
         hps["random-erasing-p"] = args.random_erasing_p
         hps["label-smoothing"] = args.label_smoothing
+        hps["use-dali"] = args.use_dali
+        if args.auto_install_dali:
+            hps["auto-install-dali"] = True
+        if args.prefetch_factor is not None:
+            hps["prefetch-factor"] = args.prefetch_factor
+        if args.max_workers is not None:
+            hps["max-workers"] = args.max_workers
+        if args.compile:
+            hps["compile"] = True
+            hps["compile-mode"] = args.compile_mode
+        # LR finder/auto-scale controls
+        hps["lr-range-iters"] = args.lr_range_iters
+        hps["lr-range-start"] = args.lr_range_start
+        hps["lr-range-end"] = args.lr_range_end
+        hps["lr-finder-policy"] = args.lr_finder_policy
+        hps["lr-auto-floor"] = args.lr_auto_floor
+        hps["lr-auto-cap"] = args.lr_auto_cap
     else:
         hps = {
             "epochs": args.epochs,
@@ -236,6 +270,13 @@ def main():
         line = f"Pipeline settings → scheduler={hps.get('scheduler')} final-epochs={hps.get('final-epochs')}"
         if hps.get('scheduler') == 'onecycle':
             line += f" onecycle-pct-start={hps.get('onecycle-pct-start')} onecycle-warmup-epochs={hps.get('onecycle-warmup-epochs','auto')} onecycle-max-lr={hps.get('onecycle-max-lr', 'auto')}"
+        line += (f" aug-policy={hps.get('aug-policy','none')} randaugment(n={hps.get('randaugment-n')},m={hps.get('randaugment-m')})"
+                 f" color-jitter={hps.get('color-jitter')} random-erasing-p={hps.get('random-erasing-p')}"
+                 f" label-smoothing={hps.get('label-smoothing')} use-dali={hps.get('use-dali', False)} lr-finder-policy={hps.get('lr-finder-policy')}"
+                 f" lr-range=[{hps.get('lr-range-start')},{hps.get('lr-range-end')}] lr-auto-floor={hps.get('lr-auto-floor')} lr-auto-cap={hps.get('lr-auto-cap')}")
+        line += (f" compile={hps.get('compile', False)} compile-mode={hps.get('compile-mode','reduce-overhead')}"
+                 f" max-workers={hps.get('max-workers','auto')} prefetch-factor={hps.get('prefetch-factor','default')}"
+                 f" auto-install-dali={hps.get('auto-install-dali', False)}")
         line += (f" aug-policy={hps.get('aug-policy','none')} randaugment(n={hps.get('randaugment-n')},m={hps.get('randaugment-m')})"
                  f" color-jitter={hps.get('color-jitter')} random-erasing-p={hps.get('random-erasing-p')}"
                  f" label-smoothing={hps.get('label-smoothing')}")
