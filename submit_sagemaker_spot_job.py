@@ -85,6 +85,22 @@ def parse_args():
     p.add_argument("--lr-finder-policy", choices=["min0.1","steepest"], default="min0.1")
     p.add_argument("--lr-auto-floor", type=float, default=1e-3)
     p.add_argument("--lr-auto-cap", type=float, default=2.5e-1)
+    # Staged augmentation controls (pipeline)
+    p.add_argument("--staged-aug", action="store_true", help="Enable 3-stage augmentation schedule in pipeline final training")
+    p.add_argument("--stage1-frac", type=float, default=0.5, help="Fraction of total epochs for stage 1")
+    p.add_argument("--stage2-frac", type=float, default=0.3, help="Fraction of total epochs for stage 2")
+    # Pipeline tuning/overrides for efficiency
+    p.add_argument("--override-batch", type=int, default=None, help="Force per-GPU batch size for pipeline final training")
+    p.add_argument("--override-lr", type=float, default=None, help="Force LR for final training (skip LR auto-scale)")
+    p.add_argument("--override-wd", type=float, default=None, help="Force weight decay for final training")
+    p.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (0=auto in pipeline)")
+    p.add_argument("--batch-safety-factor", type=float, default=None, help="Safety headroom multiplier applied to discovered max batch (default 0.9)")
+    p.add_argument("--search-batch-fraction", type=float, default=None, help="Fraction of discovered max batch to use during LR/WD search phases (default 0.5)")
+    # Checkpoint / resume (applies to both DDP and pipeline entries)
+    p.add_argument("--checkpoint-s3-uri", type=str, default=None, help="S3 URI for SageMaker managed checkpoints (e.g. s3://bucket/path/checkpoints)")
+    p.add_argument("--checkpoint-local-path", type=str, default="/opt/ml/checkpoints", help="Local path inside container for checkpoints")
+    p.add_argument("--resume", action="store_true", help="Resume training (pipeline: load latest checkpoint & continue)")
+    p.add_argument("--additional-epochs", type=int, default=0, help="Additional epochs beyond last completed when using --resume (pipeline)")
     # Pipeline worker optimizer cap
     p.add_argument("--max-workers", type=int, default=None, help="Max num_workers probe cap for pipeline worker optimization")
     return p.parse_args()
@@ -203,6 +219,30 @@ def main():
         hps["lr-finder-policy"] = args.lr_finder_policy
         hps["lr-auto-floor"] = args.lr_auto_floor
         hps["lr-auto-cap"] = args.lr_auto_cap
+        # Optional overrides / tuning
+        if args.override_batch is not None:
+            hps["override-batch"] = args.override_batch
+        if args.override_lr is not None:
+            hps["override-lr"] = args.override_lr
+        if args.override_wd is not None:
+            hps["override-wd"] = args.override_wd
+        if args.grad_accum is not None:
+            hps["grad-accum"] = args.grad_accum
+        if args.batch_safety_factor is not None:
+            hps["batch-safety-factor"] = args.batch_safety_factor
+        if args.search_batch_fraction is not None:
+            hps["search-batch-fraction"] = args.search_batch_fraction
+        # Resume/checkpoint options for pipeline
+        if args.resume:
+            hps["resume"] = True
+        if args.additional_epochs:
+            hps["additional-epochs"] = args.additional_epochs
+        hps["checkpoint-dir"] = args.checkpoint_local_path
+        # Staged augmentation flags
+        if args.staged_aug:
+            hps["staged-aug"] = True
+            hps["stage1-frac"] = args.stage1_frac
+            hps["stage2-frac"] = args.stage2_frac
     else:
         hps = {
             "epochs": args.epochs,
@@ -254,6 +294,8 @@ def main():
         sagemaker_session=sess,
         distribution={"torch_distributed": {"enabled": enable_dist}},
         disable_profiler=True,
+        checkpoint_s3_uri=args.checkpoint_s3_uri,
+        checkpoint_local_path=args.checkpoint_local_path,
     )
 
     inputs = {
@@ -278,9 +320,8 @@ def main():
         line += (f" compile={hps.get('compile', False)} compile-mode={hps.get('compile-mode','reduce-overhead')}"
                  f" max-workers={hps.get('max-workers','auto')} prefetch-factor={hps.get('prefetch-factor','default')}"
                  f" auto-install-dali={hps.get('auto-install-dali', False)}")
-        line += (f" aug-policy={hps.get('aug-policy','none')} randaugment(n={hps.get('randaugment-n')},m={hps.get('randaugment-m')})"
-                 f" color-jitter={hps.get('color-jitter')} random-erasing-p={hps.get('random-erasing-p')}"
-                 f" label-smoothing={hps.get('label-smoothing')}")
+        if hps.get('staged-aug'):
+            line += f" staged-aug=True stage1-frac={hps.get('stage1-frac')} stage2-frac={hps.get('stage2-frac')}"
         print(line)
     print(f"Using PyTorch framework_version={args.framework_version} with {args.py_version}")
 

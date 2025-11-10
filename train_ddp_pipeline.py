@@ -211,8 +211,9 @@ def make_dali_loaders(train_dir: str, val_dir: str, batch_size: int, workers: in
 
     train_p = train_pipe(batch_size=batch_size, num_threads=max(1, workers), device_id=device_id, data_root=train_dir, seed=42)
     val_p = val_pipe(batch_size=batch_size, num_threads=max(1, workers//2), device_id=device_id, data_root=val_dir, seed=42)
-    train_iter = DALIGenericIterator([train_p], output_map=["data","label"], reader_name="Reader", auto_reset=True, last_batch_policy=LastBatchPolicy.DROP, size=train_count//max(1,world))
-    val_iter = DALIGenericIterator([val_p], output_map=["data","label"], reader_name="ReaderVal", auto_reset=True, last_batch_policy=LastBatchPolicy.PARTIAL, size=val_count//max(1,world))
+    # Note: When reader_name is provided, DALI infers size from the reader. Do not pass 'size'.
+    train_iter = DALIGenericIterator([train_p], output_map=["data","label"], reader_name="Reader", auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
+    val_iter = DALIGenericIterator([val_p], output_map=["data","label"], reader_name="ReaderVal", auto_reset=True, last_batch_policy=LastBatchPolicy.PARTIAL)
 
     class DaliWrapper:
         def __init__(self, it, steps):
@@ -451,29 +452,36 @@ def accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1,)):
 # Training Loop
 # -----------------------------
 
-def train(model, train_loader, val_loader, device, epochs, lr, wd, scheduler_type, logger, grad_accum: int = 1, label_smoothing: float = 0.0):
-    scaler=torch.amp.GradScaler(enabled=torch.cuda.is_available())
-    optimizer=SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd, nesterov=True)
-    steps_per_epoch=math.ceil(len(train_loader)/max(1, grad_accum))
-    # Scheduler selection (OneCycle supports pct_start and custom max_lr)
-    onecycle_pct_start = getattr(train, "onecycle_pct_start", 0.1)  # default if not patched
+def train(model, train_loader, val_loader, device, epochs, lr, wd, scheduler_type, logger, grad_accum: int = 1,
+          label_smoothing: float = 0.0, start_epoch: int = 1, checkpoint_dir: Path | None = None,
+          schedule_epochs: int | None = None):
+    """Train for a given number of epochs.
+    start_epoch: epoch index to start from (1-based), used for resume.
+    checkpoint_dir: optional directory to mirror checkpoints (managed checkpointing).
+    """
+    scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
+    optimizer = SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd, nesterov=True)
+    steps_per_epoch = math.ceil(len(train_loader)/max(1, grad_accum))
+    onecycle_pct_start = getattr(train, "onecycle_pct_start", 0.1)
     onecycle_max_lr = getattr(train, "onecycle_max_lr", None)
-    if scheduler_type=='onecycle':
+    # Number of epochs the scheduler should span in this call (default: remaining epochs)
+    if schedule_epochs is None:
+        schedule_epochs = max(1, epochs - start_epoch + 1)
+    if scheduler_type == 'onecycle':
         max_lr = onecycle_max_lr if onecycle_max_lr is not None else lr
-        scheduler=OneCycleLR(optimizer, max_lr=max_lr, steps_per_epoch=steps_per_epoch, epochs=epochs, pct_start=onecycle_pct_start)
+        scheduler = OneCycleLR(optimizer, max_lr=max_lr, steps_per_epoch=steps_per_epoch, epochs=schedule_epochs, pct_start=onecycle_pct_start)
         if is_primary():
-            logger.info(f"[SCHED] OneCycleLR max_lr={max_lr:.4e} pct_start={onecycle_pct_start:.2f}")
+            logger.info(f"[SCHED] OneCycleLR max_lr={max_lr:.4e} pct_start={onecycle_pct_start:.2f} epochs={schedule_epochs}")
     else:
-        scheduler=CosineAnnealingLR(optimizer, T_max=epochs)
+        scheduler = CosineAnnealingLR(optimizer, T_max=schedule_epochs)
         if is_primary():
-            logger.info(f"[SCHED] CosineAnnealingLR T_max={epochs}")
-    best_top1=0.0
+            logger.info(f"[SCHED] CosineAnnealingLR T_max={schedule_epochs}")
+    best_top1 = 0.0
     if is_primary():
-        logger.info(f"[TRAIN] grad_accum={grad_accum} steps_per_epoch={steps_per_epoch}")
-    epoch_times=[]
-    # Training loss (with optional label smoothing)
+        logger.info(f"[TRAIN] start_epoch={start_epoch} epochs={epochs} grad_accum={grad_accum} steps_per_epoch={steps_per_epoch}")
+    epoch_times = []
     criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing)).to(device)
-    for epoch in range(1, epochs+1):
+    for epoch in range(start_epoch, epochs + 1):
         model.train(); epoch_loss=0.0; epoch_top1=0.0; total=0
         t_epoch_start=time.time()
         if is_primary():
@@ -524,10 +532,21 @@ def train(model, train_loader, val_loader, device, epochs, lr, wd, scheduler_typ
                                 'end_iso':time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t_epoch_end)),
                                 'duration_sec':round(dur,1),'train_loss':round(loss_epoch,4),
                                 'val_loss':round(val_loss,4),'val_top1':round(val_top1,2)})
-            if val_top1>best_top1:
-                best_top1=val_top1
-                save_checkpoint(model, optimizer, scaler, epoch, val_top1, Path('/opt/ml/model/checkpoint_best.pt'))
+            # Save checkpoints (last + best) each epoch
             save_checkpoint(model, optimizer, scaler, epoch, val_top1, Path('/opt/ml/model/checkpoint_last.pt'))
+            if checkpoint_dir is not None:
+                try:
+                    save_checkpoint(model, optimizer, scaler, epoch, val_top1, checkpoint_dir / 'checkpoint_last.pt')
+                except Exception:
+                    pass
+            if val_top1 > best_top1:
+                best_top1 = val_top1
+                save_checkpoint(model, optimizer, scaler, epoch, val_top1, Path('/opt/ml/model/checkpoint_best.pt'))
+                if checkpoint_dir is not None:
+                    try:
+                        save_checkpoint(model, optimizer, scaler, epoch, val_top1, checkpoint_dir / 'checkpoint_best.pt')
+                    except Exception:
+                        pass
     if is_primary():
         logger.info(f"Training complete. Best val top1={best_top1:.2f}%")
         # write epoch metrics CSV and plots
@@ -654,7 +673,17 @@ def main():
     ap.add_argument('--io-skip-corrupt', action='store_true', help='Replace unreadable/corrupt images with a black placeholder instead of failing.')
     ap.add_argument('--no-io-skip-corrupt', dest='io_skip_corrupt', action='store_false')
     ap.set_defaults(io_skip_corrupt=True)
-    args=ap.parse_args()
+    # Resume / checkpoint arguments (matching DDP script semantics)
+    ap.add_argument('--resume', type=str2bool, nargs='?', const=True, default=False, help='Resume from latest checkpoint in checkpoint-dir if available')
+    ap.add_argument('--additional-epochs', type=int, default=0, help='Extend training beyond last completed epoch when resuming')
+    ap.add_argument('--checkpoint-dir', type=str, default='/opt/ml/checkpoints', help='Directory for managed checkpoints (mirrors /opt/ml/model)')
+    # Staged augmentation flags (optional multi-phase training)
+    ap.add_argument('--staged-aug', type=str2bool, nargs='?', const=True, default=False, help='Enable 3-stage augmentation + scheduler sequence')
+    ap.add_argument('--stage1-frac', type=float, default=0.5, help='Fraction of total final epochs for stage 1 (OneCycle, base aug)')
+    ap.add_argument('--stage2-frac', type=float, default=0.3, help='Fraction of total final epochs for stage 2 (OneCycle, medium aug)')
+
+    # Parse CLI arguments (this was inadvertently omitted during refactor)
+    args = ap.parse_args()
 
     init_dist()
     # Set global toggles from args
@@ -795,11 +824,12 @@ def main():
 
     barrier()
 
-    # 5. Full training
+    # 5. Full training (with optional resume)
     # Rebuild loaders for full training (ensure no leftover reduced batch)
     train_loader, val_loader, _, _ = make_loaders(args.train_dir, args.val_dir, best_batch, workers, prefetch_factor=args.prefetch_factor)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    # Build final model
     model=build_model(sync_bn=True).to(device)
     # Enable cudnn benchmark for final training stability/performance (after batch size fixed)
     if torch.cuda.is_available():
@@ -817,12 +847,48 @@ def main():
         except Exception as e:
             if is_primary():
                 logger.info(f"[OPT] torch.compile skipped: {e}")
+    # Resume logic: load latest checkpoint BEFORE constructing scheduler and starting epochs
+    last_epoch_completed = 0
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    os.environ['PIPELINE_CHECKPOINT_DIR'] = str(checkpoint_dir)
+
+    def latest_ckpt_path():
+        # Prefer checkpoint-dir, fallback to /opt/ml/model
+        cand1 = checkpoint_dir / 'checkpoint_last.pt'
+        cand2 = Path('/opt/ml/model') / 'checkpoint_last.pt'
+        if cand1.exists(): return cand1
+        if cand2.exists(): return cand2
+        return None
+
+    if args.resume:
+        ck = latest_ckpt_path()
+        if ck and ck.exists():
+            if is_primary():
+                print(f"[RESUME] Loading checkpoint {ck}")
+            state = torch.load(ck, map_location=device)
+            model.load_state_dict(state.get('model_state', {}))
+            last_epoch_completed = int(state.get('epoch', 0))
+            # Optimizer/scaler states will be recreated later after LR/WD discovery (we search before training), so we deliberately skip them here.
+        else:
+            if is_primary():
+                print("[RESUME] No checkpoint found; starting from scratch.")
+
+    # Adjust total final epochs if resuming with additional-epochs
+    final_epochs = args.final_epochs
+    if args.resume and last_epoch_completed > 0 and args.additional_epochs > 0:
+        final_epochs = last_epoch_completed + args.additional_epochs
+        if is_primary():
+            print(f"[RESUME] Extending training: last_epoch={last_epoch_completed} additional={args.additional_epochs} -> final_epochs={final_epochs}")
+
+    # Wrap with DDP after (potential) weight loading
     if is_dist():
         model=DDP(model, device_ids=[int(os.environ.get('LOCAL_RANK',0))], output_device=int(os.environ.get('LOCAL_RANK',0)), find_unused_parameters=False)
+
     # Inject OneCycle parameters into train function (simple way without refactor)
     # Override pct_start if warmup epochs explicitly provided
     if args.scheduler == 'onecycle' and args.onecycle_warmup_epochs is not None:
-        computed_pct = args.onecycle_warmup_epochs / max(1, args.final_epochs)
+        computed_pct = args.onecycle_warmup_epochs / max(1, final_epochs)
         # Clamp to (0, 0.9] to avoid extremely long warmup impacting decay phase
         computed_pct = max(0.0, min(0.9, computed_pct))
         if is_primary():
@@ -859,30 +925,128 @@ def main():
         # Broadcast final LR to all ranks
         if is_dist():
             lr_tensor=torch.tensor([suggested_lr], device=device); dist.broadcast(lr_tensor, src=0); suggested_lr=float(lr_tensor.item())
-        if is_primary():
-            logger.info(f"Starting full training: epochs={args.final_epochs} batch_size={best_batch} lr={suggested_lr:.4e} wd={best_wd:.2e} scheduler={args.scheduler}")
-        train(model, train_loader, val_loader, device, args.final_epochs, suggested_lr, best_wd, args.scheduler, logger, grad_accum=grad_accum, label_smoothing=LABEL_SMOOTHING)
+        # Conditional: single-stage vs staged augmentation
+        if not bool(args.staged_aug):
+            if is_primary():
+                logger.info(f"[TRAIN-ONE] epochs={final_epochs} start_epoch={last_epoch_completed+1} batch={best_batch} lr={suggested_lr:.4e} wd={best_wd:.2e} scheduler={args.scheduler}")
+            # Rebuild loaders (already built above but ensure current aug knobs)
+            train_loader, val_loader, _, _ = make_loaders(args.train_dir, args.val_dir, best_batch, workers, prefetch_factor=args.prefetch_factor)
+            remaining = max(1, final_epochs - last_epoch_completed)
+            train(model, train_loader, val_loader, device, final_epochs, suggested_lr, best_wd, args.scheduler, logger,
+                  grad_accum=grad_accum, label_smoothing=LABEL_SMOOTHING, start_epoch=last_epoch_completed + 1,
+                  checkpoint_dir=checkpoint_dir, schedule_epochs=remaining)
+            if is_primary():
+                summary = {
+                    'final_epochs': final_epochs,
+                    'staged': False,
+                    'last_epoch_completed': final_epochs,
+                    'resumed': bool(args.resume and last_epoch_completed > 0),
+                    'batch_size': best_batch,
+                    'learning_rate_final': suggested_lr,
+                    'weight_decay_final': best_wd,
+                }
+                with open('/opt/ml/model/logs/summary.json','w') as f:
+                    json.dump(summary, f, indent=2)
+        else:
+            if is_primary():
+                logger.info(f"[STAGES] Preparing staged augmentation schedule total_epochs={final_epochs} f1={args.stage1_frac} f2={args.stage2_frac}")
+            # Stage fractions
+            f1 = max(0.0, min(1.0, args.stage1_frac))
+            f2 = max(0.0, min(1.0, args.stage2_frac))
+            if f1 + f2 > 0.95:
+                # Avoid starving last stage; cap sum
+                scale = 0.95 / max(1e-6, f1 + f2)
+                f1 *= scale; f2 *= scale
+            f3 = max(0.0, 1.0 - f1 - f2)
+            total = final_epochs
+            stage1_epochs = max(0, int(round(total * f1)))
+            stage2_epochs = max(0, int(round(total * f2)))
+            stage3_epochs = max(0, total - stage1_epochs - stage2_epochs)
+            # Avoid zero-length first stage if user chose tiny fraction
+            if stage1_epochs == 0 and (stage2_epochs > 0 or stage3_epochs > 0):
+                stage1_epochs = 1; stage3_epochs = max(0, total - stage1_epochs - stage2_epochs)
+            current_start = last_epoch_completed + 1
+            abs_end_stage1 = current_start + stage1_epochs - 1
+            abs_end_stage2 = abs_end_stage1 + stage2_epochs
+            abs_end_stage3 = last_epoch_completed + total
+            if is_primary():
+                logger.info(f"[STAGES] Stage1: {current_start}-{abs_end_stage1} onecycle base")
+                logger.info(f"[STAGES] Stage2: {abs_end_stage1+1}-{abs_end_stage2} onecycle medium")
+                logger.info(f"[STAGES] Stage3: {abs_end_stage2+1}-{abs_end_stage3} cosine strong")
+
+            def set_aug(strength: str):
+                global AUG_POLICY, RAND_N, RAND_M, COLOR_JITTER, RANDOM_ERASING_P
+                if strength == 'base':
+                    pass
+                elif strength == 'medium':
+                    if AUG_POLICY == 'none':
+                        AUG_POLICY = 'randaugment'; RAND_N = max(2, RAND_N); RAND_M = max(9, RAND_M)
+                    COLOR_JITTER = max(COLOR_JITTER, 0.1)
+                    RANDOM_ERASING_P = max(RANDOM_ERASING_P, 0.05)
+                elif strength == 'strong':
+                    if AUG_POLICY != 'autoaugment':
+                        AUG_POLICY = 'randaugment'
+                    RAND_N = max(2, RAND_N); RAND_M = max(10, RAND_M)
+                    COLOR_JITTER = max(COLOR_JITTER, 0.2)
+                    RANDOM_ERASING_P = max(RANDOM_ERASING_P, 0.15)
+                if is_primary():
+                    logger.info(f"[AUG] strength={strength} policy={AUG_POLICY} rand(n={RAND_N},m={RAND_M}) cj={COLOR_JITTER} re_p={RANDOM_ERASING_P}")
+
+            def rebuild_loaders():
+                return make_loaders(args.train_dir, args.val_dir, best_batch, workers, prefetch_factor=args.prefetch_factor)
+
+            # Stage 1
+            if stage1_epochs > 0 and last_epoch_completed < abs_end_stage1:
+                set_aug('base')
+                train_loader, val_loader, _, _ = rebuild_loaders()
+                s_start = max(current_start, 1)
+                s_end = abs_end_stage1
+                sched_len = max(1, s_end - s_start + 1)
+                train(model, train_loader, val_loader, device, s_end, suggested_lr, best_wd, 'onecycle', logger,
+                      grad_accum=grad_accum, label_smoothing=LABEL_SMOOTHING, start_epoch=s_start,
+                      checkpoint_dir=checkpoint_dir, schedule_epochs=sched_len)
+                last_epoch_completed = s_end; current_start = s_end + 1
+            # Stage 2
+            if stage2_epochs > 0 and last_epoch_completed < abs_end_stage2:
+                set_aug('medium')
+                train_loader, val_loader, _, _ = rebuild_loaders()
+                s_start = max(last_epoch_completed + 1, abs_end_stage1 + 1)
+                s_end = abs_end_stage2
+                sched_len = max(1, s_end - s_start + 1)
+                train(model, train_loader, val_loader, device, s_end, suggested_lr * 0.9, best_wd, 'onecycle', logger,
+                      grad_accum=grad_accum, label_smoothing=LABEL_SMOOTHING, start_epoch=s_start,
+                      checkpoint_dir=checkpoint_dir, schedule_epochs=sched_len)
+                last_epoch_completed = s_end; current_start = s_end + 1
+            # Stage 3
+            if stage3_epochs > 0 and last_epoch_completed < abs_end_stage3:
+                set_aug('strong')
+                train_loader, val_loader, _, _ = rebuild_loaders()
+                s_start = max(last_epoch_completed + 1, abs_end_stage2 + 1)
+                s_end = abs_end_stage3
+                sched_len = max(1, s_end - s_start + 1)
+                train(model, train_loader, val_loader, device, s_end, suggested_lr * 0.7, best_wd, 'cosine', logger,
+                      grad_accum=grad_accum, label_smoothing=LABEL_SMOOTHING, start_epoch=s_start,
+                      checkpoint_dir=checkpoint_dir, schedule_epochs=sched_len)
+                last_epoch_completed = s_end
+            if is_primary():
+                summary = {
+                    'final_epochs': final_epochs,
+                    'staged': True,
+                    'stage1_epochs': stage1_epochs,
+                    'stage2_epochs': stage2_epochs,
+                    'stage3_epochs': stage3_epochs,
+                    'last_epoch_completed': last_epoch_completed,
+                    'resumed': bool(args.resume and last_epoch_completed > 0),
+                    'batch_size': best_batch,
+                    'learning_rate_final': suggested_lr,
+                    'weight_decay_final': best_wd,
+                }
+                with open('/opt/ml/model/logs/summary.json','w') as f:
+                    json.dump(summary, f, indent=2)
     except Exception as e:
         if is_primary():
-            logger.error(f"[ERROR] Exception during training phase: {e}")
+            print(f"[ERROR] Exception during staged training: {e}")
         raise
-
-    # Synchronize all ranks before writing summary / destroying process group.
-    if is_dist():
-        barrier()
-
-    if is_primary():
-        logger.info("Pipeline completed successfully.")
-        # Write summary JSON
-        summary={
-            'num_workers': workers,
-            'batch_size': best_batch,
-            'lr': suggested_lr,
-            'weight_decay': best_wd,
-            'scheduler': args.scheduler,
-            'epochs': args.final_epochs
-        }
-        with open('/opt/ml/model/logs/summary.json','w') as f: json.dump(summary,f,indent=2)
 
     if is_dist():
         # Clean shutdown to avoid NCCL lingering warnings; ensure no further collectives.
