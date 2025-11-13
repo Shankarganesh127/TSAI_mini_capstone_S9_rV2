@@ -74,6 +74,8 @@ def parse_args():
     p.add_argument("--use-dali", action="store_true", help="Enable NVIDIA DALI data pipeline if available in training container")
     p.add_argument("--auto-install-dali", action="store_true", help="Attempt to pip install NVIDIA DALI on the training container if missing (pipeline entry only)")
     p.add_argument("--prefetch-factor", type=int, default=None, help="Prefetch factor for DataLoader workers (pipeline entry only)")
+    # Early stopping target
+    p.add_argument("--target-val-top1", type=float, default=None, help="Stop training early when validation top1 (percent) reaches this value")
     # Compile toggle (pipeline)
     p.add_argument("--compile", action="store_true", help="Enable torch.compile in pipeline entry")
     p.add_argument("--compile-mode", choices=["default","reduce-overhead","max-autotune"], default="reduce-overhead",
@@ -82,13 +84,29 @@ def parse_args():
     p.add_argument("--lr-range-iters", type=int, default=100)
     p.add_argument("--lr-range-start", type=float, default=1e-5)
     p.add_argument("--lr-range-end", type=float, default=1.0)
-    p.add_argument("--lr-finder-policy", choices=["min0.1","steepest"], default="min0.1")
+    p.add_argument("--lr-finder-policy", choices=["min0.1","steepest","steepest-pre-min"], default="min0.1",
+                   help="Policy for selecting LR after range test ('min0.1','steepest','steepest-pre-min').")
+    p.add_argument("--lr-finder-at-final-batch", action="store_true",
+                   help="Run LR finder at final (post-discovery) batch size instead of search batch fraction.")
     p.add_argument("--lr-auto-floor", type=float, default=1e-3)
     p.add_argument("--lr-auto-cap", type=float, default=2.5e-1)
     # Staged augmentation controls (pipeline)
-    p.add_argument("--staged-aug", action="store_true", help="Enable 3-stage augmentation schedule in pipeline final training")
-    p.add_argument("--stage1-frac", type=float, default=0.5, help="Fraction of total epochs for stage 1")
-    p.add_argument("--stage2-frac", type=float, default=0.3, help="Fraction of total epochs for stage 2")
+    p.add_argument("--staged-aug", action="store_true", help="Enable 4-stage augmentation schedule (high OneCycle / high Cosine / medium OneCycle / medium Cosine)")
+    p.add_argument("--stage1-frac", type=float, default=0.4, help="Fraction of total epochs for stage 1 (high aug, OneCycle)")
+    p.add_argument("--stage2-frac", type=float, default=0.4, help="Fraction of total epochs for stage 2 (high aug, Cosine)")
+    p.add_argument("--stage3-frac", type=float, default=0.1, help="Fraction of total epochs for stage 3 (medium aug, OneCycle)")
+    p.add_argument("--stage4-frac", type=float, default=0.1, help="Fraction of total epochs for stage 4 (medium aug, Cosine)")
+    # Per-stage overrides (optional)
+    p.add_argument("--stage1-wd", type=float, default=None, help="Override weight decay for stage 1")
+    p.add_argument("--stage2-wd", type=float, default=None, help="Override weight decay for stage 2")
+    p.add_argument("--stage3-wd", type=float, default=None, help="Override weight decay for stage 3")
+    p.add_argument("--stage4-wd", type=float, default=None, help="Override weight decay for stage 4")
+    p.add_argument("--stage1-lr", type=float, default=None, help="Override base LR for stage 1")
+    p.add_argument("--stage2-lr", type=float, default=None, help="Override base LR for stage 2")
+    p.add_argument("--stage3-lr", type=float, default=None, help="Override base LR for stage 3")
+    p.add_argument("--stage4-lr", type=float, default=None, help="Override base LR for stage 4")
+    p.add_argument("--stage1-onecycle-max-lr", type=float, default=None, help="Override OneCycle max LR for stage 1 (if OneCycle)")
+    p.add_argument("--stage3-onecycle-max-lr", type=float, default=None, help="Override OneCycle max LR for stage 3 (if OneCycle)")
     # Pipeline tuning/overrides for efficiency
     p.add_argument("--override-batch", type=int, default=None, help="Force per-GPU batch size for pipeline final training")
     p.add_argument("--override-lr", type=float, default=None, help="Force LR for final training (skip LR auto-scale)")
@@ -96,6 +114,11 @@ def parse_args():
     p.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (0=auto in pipeline)")
     p.add_argument("--batch-safety-factor", type=float, default=None, help="Safety headroom multiplier applied to discovered max batch (default 0.9)")
     p.add_argument("--search-batch-fraction", type=float, default=None, help="Fraction of discovered max batch to use during LR/WD search phases (default 0.5)")
+    # Skips for pipeline discovery phases
+    p.add_argument("--skip-lr-finder", action="store_true", help="Skip LR finder in pipeline (requires override-lr)")
+    p.add_argument("--skip-wd-finder", action="store_true", help="Skip WD finder in pipeline (requires override-wd)")
+    p.add_argument("--skip-batch-finder", action="store_true", help="Skip batch-size finder in pipeline (requires override-batch)")
+    p.add_argument("--one-stage-aug-split", type=float, default=None, help="When not using staged-aug, apply augmentation for first <frac> of epochs then none (e.g., 0.8)")
     # Checkpoint / resume (applies to both DDP and pipeline entries)
     p.add_argument("--checkpoint-s3-uri", type=str, default=None, help="S3 URI for SageMaker managed checkpoints (e.g. s3://bucket/path/checkpoints)")
     p.add_argument("--checkpoint-local-path", type=str, default="/opt/ml/checkpoints", help="Local path inside container for checkpoints")
@@ -188,6 +211,8 @@ def main():
             # Provide sensible defaults for pipeline discovery inputs
             # (pipeline has its own defaults; we only forward essentials)
         }
+        if args.target_val_top1 is not None:
+            hps["target-val-top1"] = args.target_val_top1
         if args.scheduler == "onecycle":
             hps["onecycle-pct-start"] = args.onecycle_pct_start
             if args.onecycle_max_lr is not None:
@@ -219,6 +244,13 @@ def main():
         hps["lr-finder-policy"] = args.lr_finder_policy
         hps["lr-auto-floor"] = args.lr_auto_floor
         hps["lr-auto-cap"] = args.lr_auto_cap
+        # Optional skips for discovery phases
+        if args.skip_lr_finder:
+            hps["skip-lr-finder"] = True
+        if args.skip_wd_finder:
+            hps["skip-wd-finder"] = True
+        if getattr(args, "skip_batch_finder", False):
+            hps["skip-batch-finder"] = True
         # Optional overrides / tuning
         if args.override_batch is not None:
             hps["override-batch"] = args.override_batch
@@ -243,6 +275,25 @@ def main():
             hps["staged-aug"] = True
             hps["stage1-frac"] = args.stage1_frac
             hps["stage2-frac"] = args.stage2_frac
+            hps["stage3-frac"] = args.stage3_frac
+            hps["stage4-frac"] = args.stage4_frac
+            # Forward stage-specific overrides if provided
+            if args.stage1_wd is not None: hps["stage1-wd"] = args.stage1_wd
+            if args.stage2_wd is not None: hps["stage2-wd"] = args.stage2_wd
+            if args.stage3_wd is not None: hps["stage3-wd"] = args.stage3_wd
+            if args.stage4_wd is not None: hps["stage4-wd"] = args.stage4_wd
+            if args.stage1_lr is not None: hps["stage1-lr"] = args.stage1_lr
+            if args.stage2_lr is not None: hps["stage2-lr"] = args.stage2_lr
+            if args.stage3_lr is not None: hps["stage3-lr"] = args.stage3_lr
+            if args.stage4_lr is not None: hps["stage4-lr"] = args.stage4_lr
+            if args.stage1_onecycle_max_lr is not None: hps["stage1-onecycle-max-lr"] = args.stage1_onecycle_max_lr
+            if args.stage3_onecycle_max_lr is not None: hps["stage3-onecycle-max-lr"] = args.stage3_onecycle_max_lr
+        # LR finder at final batch size toggle
+        if getattr(args, "lr_finder_at_final_batch", False):
+            hps["lr-finder-at-final-batch"] = True
+        # Single-stage augmentation split (only meaningful when not staged-aug inside pipeline script)
+        if args.one_stage_aug_split is not None:
+            hps["one-stage-aug-split"] = args.one_stage_aug_split
     else:
         hps = {
             "epochs": args.epochs,
@@ -251,6 +302,8 @@ def main():
             "weight-decay": args.weight_decay,
             "workers": args.workers,
         }
+        if args.target_val_top1 is not None:
+            hps["target-val-top1"] = args.target_val_top1
         if args.nesterov:
             hps["nesterov"] = True
 
@@ -276,6 +329,20 @@ def main():
 
     minimal_source = build_source_dir()
 
+    # Environment variables for stability and memory behavior
+    env = {
+        # Help reduce fragmentation-related OOM
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        # Better NCCL error propagation when any rank fails (new var) and fallback old var
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+        "NCCL_ASYNC_ERROR_HANDLING": "1",
+        # Increase NCCL heartbeat timeout to reduce spurious watchdog terminations on heavy kernels
+        "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "1200",
+        # Enable detailed NCCL logging when needed for debugging
+        "NCCL_DEBUG": "INFO",
+        "NCCL_DEBUG_SUBSYS": "ALL",
+    }
+
     estimator = PyTorch(
         entry_point=entry_point,
         source_dir=minimal_source,
@@ -287,6 +354,7 @@ def main():
         output_path=s3_output,
         base_job_name=job_name,
         hyperparameters=hps,
+        environment=env,
         use_spot_instances=not args.no_spot,
         max_wait=args.max_wait if not args.no_spot else None,
         max_run=args.max_run,
@@ -321,7 +389,12 @@ def main():
                  f" max-workers={hps.get('max-workers','auto')} prefetch-factor={hps.get('prefetch-factor','default')}"
                  f" auto-install-dali={hps.get('auto-install-dali', False)}")
         if hps.get('staged-aug'):
-            line += f" staged-aug=True stage1-frac={hps.get('stage1-frac')} stage2-frac={hps.get('stage2-frac')}"
+            line += (f" staged-aug=True stage1-frac={hps.get('stage1-frac')} stage2-frac={hps.get('stage2-frac')}"
+                     f" stage3-frac={hps.get('stage3-frac')} stage4-frac={hps.get('stage4-frac')}")
+        if hps.get('lr-finder-at-final-batch'):
+            line += " lr-finder-at-final-batch=True"
+        if hps.get('target-val-top1') is not None:
+            line += f" target-val-top1={hps.get('target-val-top1')}"
         print(line)
     print(f"Using PyTorch framework_version={args.framework_version} with {args.py_version}")
 
